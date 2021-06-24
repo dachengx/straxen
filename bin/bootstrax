@@ -331,6 +331,7 @@ def new_context(cores=args.cores,
         allow_multiprocess=cores > 1,
         allow_shm=cores > 1,
         allow_lazy=False,
+        use_rucio=False,
         max_messages=max_messages,
         timeout=timeout)
     if not args.production:
@@ -643,9 +644,9 @@ def set_state(state, update_fields=None):
     """
     # Find the last message of this host
     previous_entry = bs_coll.find_one({'host': hostname},
-                                      sort=[('time', pymongo.DESCENDING)])
-    if not state:
-        state = 'None' if not previous_entry else previous_entry.get('state')
+                                      sort=[('_id', pymongo.DESCENDING)])
+    if state is None:
+        state = 'None' if previous_entry is None else previous_entry.get('state')
 
     bootstrax_state = dict(
         host=hostname,
@@ -660,9 +661,14 @@ def set_state(state, update_fields=None):
     )
     if update_fields:
         bootstrax_state.update(update_fields)
-    if (not previous_entry or
-            (now() - previous_entry['_id'].generation_time).seconds > timeouts[
-                'min_status_interval']):
+
+    need_new_doc = (
+        (previous_entry is None) or
+        ((now() - previous_entry['time'].replace(tzinfo=pytz.utc)).seconds
+         > timeouts['min_status_interval']
+         )
+    )
+    if need_new_doc:
         bs_coll.insert_one(bootstrax_state)
     else:
         bs_coll.update_one({'_id': previous_entry['_id']}, {'$set': bootstrax_state})
@@ -1471,8 +1477,8 @@ def process_run(rd, send_heartbeats=args.production):
 
         while True:
             if send_heartbeats:
-                to_report = ('run_id', 'targets', 'cores', 'max_messages',
-                             'timeout', 'post_processing'),
+                to_report = ['run_id', 'targets', 'cores', 'max_messages',
+                             'timeout', 'post_processing']
                 update = {k: v for k, v in run_strax_config.items() if k in to_report}
                 send_heartbeat(update)
             ec = strax_proc.exitcode

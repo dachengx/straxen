@@ -4,7 +4,7 @@ import straxen
 from warnings import warn
 from .position_reconstruction import DEFAULT_POSREC_ALGO_OPTION
 from straxen.common import pax_file, get_resource, first_sr1_run, pre_apply_function
-from straxen.get_corrections import get_correction_from_cmt, get_config_from_cmt, get_elife
+from straxen.get_corrections import get_correction_from_cmt
 from straxen.itp_map import InterpolatingMap
 export, __all__ = strax.exporter()
 
@@ -328,6 +328,11 @@ class EventBasics(strax.LoopPlugin):
         default=("electron_drift_velocity", "ONLINE", True)
     ),
     strax.Option(
+        name='electron_drift_time_gate',
+        help='Electron drift time from the gate in ns',
+        default=("electron_drift_time_gate", "ONLINE", True)
+    ),
+    strax.Option(
         name='fdc_map',
         help='3D field distortion correction map path',
         default_by_run=[
@@ -350,7 +355,7 @@ class EventPositions(strax.Plugin):
 
     depends_on = ('event_basics', )
     
-    __version__ = '0.1.3'
+    __version__ = '0.1.4'
 
     dtype = [
         ('x', np.float32,
@@ -358,7 +363,7 @@ class EventPositions(strax.Plugin):
         ('y', np.float32,
          'Interaction y-position, field-distortion corrected (cm)'),
         ('z', np.float32,
-         'Interaction z-position, field-distortion corrected (cm)'),
+         'Interaction z-position, using mean drift velocity only (cm)'),
         ('r', np.float32,
          'Interaction radial position, field-distortion corrected (cm)'),
         ('z_naive', np.float32,
@@ -367,6 +372,8 @@ class EventPositions(strax.Plugin):
          'Interaction r-position using observed S2 positions directly (cm)'),
         ('r_field_distortion_correction', np.float32,
          'Correction added to r_naive for field distortion (cm)'),
+        ('z_field_distortion_correction', np.float32,
+         'Correction added to z_naive for field distortion (cm)'),
         ('theta', np.float32,
          'Interaction angular position (radians)')
             ] + strax.time_fields
@@ -375,14 +382,13 @@ class EventPositions(strax.Plugin):
 
         is_CMT = isinstance(self.config['fdc_map'], tuple)
         self.electron_drift_velocity = get_correction_from_cmt(self.run_id, self.config['electron_drift_velocity'])
+        self.electron_drift_time_gate = get_correction_from_cmt(self.run_id, self.config['electron_drift_time_gate'])
         if is_CMT:
-
-            cmt, cmt_conf, is_nt = self.config['fdc_map']
-            cmt_conf = (f'{cmt_conf[0]}_{self.config["default_reconstruction_algorithm"]}' , cmt_conf[1])
-            map_algo = cmt, cmt_conf, is_nt           
- 
+            config_name, cmt_version, is_nt = self.config['fdc_map']
+            map_algo = f'{config_name}_{self.config["default_reconstruction_algorithm"]}'
+            cmt_conf = map_algo, cmt_version, is_nt
             self.map = InterpolatingMap(
-                get_resource(get_config_from_cmt(self.run_id, map_algo), fmt='binary'))
+                get_resource(get_correction_from_cmt(self.run_id, cmt_conf), fmt='binary'))
             self.map.scale_coordinates([1., 1., -self.electron_drift_velocity])
 
         elif isinstance(self.config['fdc_map'], str):
@@ -397,7 +403,7 @@ class EventPositions(strax.Plugin):
         result = {'time': events['time'],
                   'endtime': strax.endtime(events)}
         
-        z_obs = - self.electron_drift_velocity * events['drift_time']
+        z_obs = - self.electron_drift_velocity * (events['drift_time'] - self.electron_drift_time_gate)
         orig_pos = np.vstack([events[f's2_x'], events[f's2_y'], z_obs]).T
         r_obs = np.linalg.norm(orig_pos[:, :2], axis=1)
         delta_r = self.map(orig_pos)
@@ -413,7 +419,10 @@ class EventPositions(strax.Plugin):
         with np.errstate(invalid='ignore'):
             z_cor = -(z_obs ** 2 - delta_r ** 2) ** 0.5
             invalid = np.abs(z_obs) < np.abs(delta_r)
+            # do not apply z correction above gate
+            invalid |= z_obs >= 0
         z_cor[invalid] = z_obs[invalid]
+        delta_z = z_cor - z_obs
 
         result.update({'x': orig_pos[:, 0] * scale,
                        'y': orig_pos[:, 1] * scale,
@@ -422,7 +431,9 @@ class EventPositions(strax.Plugin):
                        'r_field_distortion_correction': delta_r,
                        'theta': np.arctan2(orig_pos[:, 1], orig_pos[:, 0]),
                        'z_naive': z_obs,
-                       'z': z_cor})
+                       'z': z_obs,
+                       'z_field_distortion_correction': delta_z
+                       })
 
         return result
 
@@ -475,24 +486,18 @@ class CorrectedAreas(strax.Plugin):
 
     def setup(self):
         is_CMT = isinstance(self.config['s1_xyz_correction_map'], tuple)
-
         if is_CMT:
-            cmt, cmt_conf, is_nt = self.config['s1_xyz_correction_map']
-            cmt_conf = (f'{cmt_conf[0]}_{self.config["default_reconstruction_algorithm"]}', cmt_conf[1])
-            map_algo = cmt, cmt_conf, is_nt
-
-            self.s1_map = InterpolatingMap(get_resource(get_config_from_cmt(self.run_id, map_algo)))
+            config_name, cmt_version, is_nt = self.config['s1_xyz_correction_map']
+            map_algo = f'{config_name}_{self.config["default_reconstruction_algorithm"]}'
+            cmt_conf = map_algo, cmt_version, is_nt
+            self.s1_map = InterpolatingMap(get_resource(get_correction_from_cmt(self.run_id, cmt_conf)))
         else:
             self.s1_map = InterpolatingMap(
                 get_resource(self.config['s1_xyz_correction_map']))
 
         self.s2_map = InterpolatingMap(
-                get_resource(get_config_from_cmt(self.run_id, self.config['s2_xy_correction_map'])))
+                get_resource(get_correction_from_cmt(self.run_id, self.config['s2_xy_correction_map'])))
         self.elife = get_correction_from_cmt(self.run_id, self.config['elife_conf'])
-
-        if isinstance(self.elife, str):
-            # Legacy 1T support
-            self.elife = get_elife(self.run_id, self.elife)
 
     def compute(self, events):
         # S1 corrections depend on the actual corrected event position.
@@ -567,32 +572,3 @@ class EnergyEstimates(strax.Plugin):
 
     def cs2_to_e(self, x):
         return self.config['lxe_w'] * x / self.config['g2']
-
-
-@strax.takes_config(
-    strax.Option(
-        name='event_info_function',
-        default='pre_apply_function',
-        help="Function that must be applied to all event_info data. Do not change.",
-    )
-)
-class EventInfo(strax.MergeOnlyPlugin):
-    """
-    Plugin which merges the information of all event data_kinds into a
-    single data_type.
-    """
-    depends_on = ['events',
-                  'event_basics', 'event_positions', 'corrected_areas',
-                  'energy_estimates']
-    save_when = strax.SaveWhen.ALWAYS
-
-    def compute(self, **kwargs):
-        event_info_function = self.config['event_info_function']
-        event_info = super().compute(**kwargs)
-        if event_info_function != 'disabled':
-            event_info = pre_apply_function(event_info,
-                                            self.run_id,
-                                            self.provides,
-                                            event_info_function,
-                                            )
-        return event_info
