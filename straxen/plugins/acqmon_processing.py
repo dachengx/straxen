@@ -216,3 +216,89 @@ class VetoProximity(strax.OverlapWindowPlugin):
         result['time'] = events['time']
         result['endtime'] = events['endtime']
         return result
+
+@export
+@strax.takes_config(
+    strax.Option('veto_proximity_window', default=int(5e8), type=int, track=True,
+                 help='Maximum separation between veto stop and start pulses [ns]'))
+class PeakVetoProximity(strax.OverlapWindowPlugin):
+    """
+    Find the closest next/previous veto start and end to each peak center.
+    previous_x: Time in ns between the time center of a peak and the previous x
+    next_x: Time in ns between the time center of a peak and the next x
+    This also considers any x inside the peak. x could be either:
+        - busy_x: busy on/off signal
+        - he_x:   high energy channels busy on/off signal
+        - hev_x:  high energy veto on/off signal
+    """
+
+    __version__ = '0.0.1'
+    depends_on = ('peak_basics', 'aqmon_hits')
+    provides = ('peak_veto_proximity')
+    save_when = strax.SaveWhen.TARGET
+    veto_names = ['busy', 'he', 'hev']
+
+    def infer_dtype(self):
+        dtype = []
+        for n in self.veto_names:
+            dtype += [
+                ((f'Time to previous {n} veto start [ns]', f'previous_{n}_on'), np.int64),
+                ((f'Time to previous {n} veto end [ns]', f'previous_{n}_off'), np.int64),
+                ((f'Time to next {n} veto start [ns]', f'next_{n}_on'), np.int64),
+                ((f'Time to next {n} veto end [ns]', f'next_{n}_off'), np.int64),
+                ]
+        dtype += strax.time_fields
+        return dtype
+
+    def setup(self):
+        self.channel_map = {name: ch + straxen.n_hard_aqmon_start for ch, name in
+                            enumerate(['sum_wf', 'm_veto_sync',
+                                       'hev_stop', 'hev_start',
+                                       'he_stop', 'he_start',
+                                       'busy_stop', 'busy_start'])}
+        self.states = ['on', 'off']
+
+    def get_window_size(self):
+        return int(self.config['veto_proximity_window'] * 100)
+
+    def compute(self, peaks, aqmon_hits):
+        result = np.zeros(len(peaks), self.dtype)
+        t_peak_centers = (peaks['time'] + strax.endtime(peaks)) // 2
+
+        for name in self.veto_names:
+            # For each state find the next and previous veto
+            for state in self.states:
+                prev = f'previous_{name}_{state}'
+                nxt = f'next_{name}_{state}'
+
+                if state == 'on':
+                    aqmon_chan = self.channel_map[f'{name}_start']
+                else:
+                    aqmon_chan = self.channel_map[f'{name}_stop']
+                veto_start_time_selection = aqmon_hits[aqmon_hits['channel'] == aqmon_chan]['time']
+
+                inx = 0
+                for peak_i, peak_center in enumerate(t_peak_centers):
+                    if len(veto_start_time_selection):
+                        inx = np.searchsorted(veto_start_time_selection, peak_center, side='right')
+
+                    # Time to previous veto on/off
+                    # Just using a huge value that will not fit in any potential
+                    # DAQVetoCut range
+                    if inx == 0:
+                        previous_veto = T_NO_VETO_FOUND
+                    else:
+                        previous_veto = peak_center - veto_start_time_selection[inx - 1]
+                    # Time to next veto on/off
+                    if inx == len(veto_start_time_selection):
+                        next_veto = T_NO_VETO_FOUND
+                    else:
+                        next_veto = veto_start_time_selection[inx] - peak_center
+
+                    result[peak_i][prev] = previous_veto
+                    result[peak_i][nxt] = next_veto
+
+        # Add the peaks time and endtime to the final result
+        result['time'] = peaks['time']
+        result['endtime'] = strax.endtime(peaks)
+        return result
